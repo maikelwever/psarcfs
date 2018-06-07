@@ -1,0 +1,9 @@
+[package]
+name = "psarc"
+version = "0.1.0"
+authors = ["Maikel Wever <maikelwever@gmail.com>"]
+
+[dependencies]
+byteorder = "1"
+clap = "2.31"
+error-chain = "0.11"
