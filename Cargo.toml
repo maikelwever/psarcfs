@@ -6,6 +6,7 @@ authors = ["Maikel Wever <maikelwever@gmail.com>"]
 [dependencies]
 byteorder = "1"
 clap = "2.31"
-error-chain = "*"
-lzma-rs = '*'
-libmath = '*'
+error-chain = "0.12"
+lzma-rs = '0.1'
+libmath = '0.2'
+flate2 = "1.0"

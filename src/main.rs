@@ -2,10 +2,12 @@
 #[macro_use] extern crate error_chain;
 
 extern crate byteorder;
+extern crate flate2;
 extern crate lzma_rs;
 extern crate math;
 
 use byteorder::{ReadBytesExt, BigEndian};
+use flate2::bufread::ZlibDecoder;
 use lzma_rs::lzma_decompress;
 use math::round;
 
@@ -21,8 +23,9 @@ error_chain!{
 }
 
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 enum CompressionType {
+    None,
     ZLIB,
     LZMA
 }
@@ -100,6 +103,7 @@ impl PSArc {
         let compression_type = match file.read_u32::<BigEndian>() {
             Ok(value) => {
                 match value {
+                    0x00000000 => CompressionType::None,
                     0x7A6C6962 => CompressionType::ZLIB,
                     0x6C7A6D61 => CompressionType::LZMA,
                     _ => {
@@ -122,6 +126,7 @@ impl PSArc {
             }
         };
         let archive_flags = match file.read_u32::<BigEndian>() {
+            // TODO: replace this with bitflags.
             Ok(value) => {
                 match value {
                     0 => ArchiveFlags::RelativePaths,
@@ -167,13 +172,18 @@ impl PSArc {
     }
 
     fn parse_manifest(&mut self, file: &mut BufReader<File>) -> Result<()> {
-        let mut c = Cursor::new(Vec::<u8>::new());
-        self.print_file(file, &mut c, 0)?;
-        //let reader = BufReader::new(c);
-        let mut d = String::new();
-        c.read_to_string(&mut d)?;
-        let mut lines: Vec<&str> = d.lines().collect();
-        lines.insert(0, "manifest.txt");
+        let mut cursor = Cursor::new(Vec::<u8>::new());
+        self.print_file(file, &mut cursor, 0)?;
+        let mut string_data = String::new();
+        cursor.seek(SeekFrom::Start(0))?;
+        cursor.read_to_string(&mut string_data)?;
+        eprintln!("String data: {:}", string_data);
+        let mut lines: Vec<&str> = string_data.lines().collect();
+        let manifest_name = match self.archive_flags {
+            ArchiveFlags::AbsolutePaths => "/manifest.txt",
+            _ => "manifest.txt"
+        };
+        lines.insert(0, manifest_name);
         for (i, line) in lines.iter().enumerate() {
             self.entries[i].name = line.to_string();
         }
@@ -201,26 +211,43 @@ impl PSArc {
         let entry_details = &self.entries[index];
         eprintln!("{:?}", entry_details);
 
-        let current_index: usize = entry_details.index_list_size as usize;
-        let blockdetail = self.block_sizes[current_index];
-        let total_bytes = blockdetail * self.block_size.get_bitcount() as u64;
         let blocks = round::ceil(entry_details.length as f64 / self.block_size.get_bitcount() as f64, 0) as u64;
-
         file.seek(SeekFrom::Start(entry_details.offset))?;
 
-        if total_bytes == entry_details.length {
-            eprintln!("Compressed length is the same as original length.");
-            let filesize = blocks * self.block_size.get_bitcount();
-            let mut datastream = file.take(filesize);
-            io::copy(&mut datastream, out)?;
-        } else {
-            let header = file.read_u16::<BigEndian>()?;
-            eprintln!("Header value: {:X}", header);
-            file.seek(SeekFrom::Start(entry_details.offset))?;
-            for _ in 0..blocks {
-                let mut datastream = file.take(self.block_size.get_bitcount());
-                lzma_decompress(&mut datastream, out).unwrap();
+        let compression = match file.read_u16::<BigEndian>() {
+            Ok(value) => {
+                eprintln!("Header: {:X}", value);
+                match value {
+                    0x78da | 0x7801 => CompressionType::ZLIB,
+                    0x5D00 => CompressionType::LZMA,
+                    _ => CompressionType::None
+                }
+            },
+            Err(e) => { 
+                return Err(Error::from(e)); 
             }
+        };
+        eprintln!("File compression: {:?}", compression);
+        file.seek(SeekFrom::Start(entry_details.offset))?;
+        match compression {
+            CompressionType::None => {
+                let filesize = entry_details.length;
+                let mut datastream = file.take(filesize);
+                io::copy(&mut datastream, out)?;
+            },
+            CompressionType::LZMA => {
+                for _ in 0..blocks {
+                    let mut datastream = file.take(self.block_size.get_bitcount());
+                    lzma_decompress(&mut datastream, out).unwrap();
+                }
+            },
+            CompressionType::ZLIB => {
+                for _ in 0..blocks {
+                    let datastream = file.take(self.block_size.get_bitcount());
+                    let mut decoder = ZlibDecoder::new(datastream);
+                    io::copy(&mut decoder, out)?;
+                }
+            },
         }
 
         Ok(())
@@ -247,4 +274,6 @@ fn main() {
     };
     psarc.print_details();
     psarc.print_filelist();
+    //let mut stdout = io::stdout();
+    //psarc.print_file(&mut reader, &mut stdout, 0).unwrap();
 }
