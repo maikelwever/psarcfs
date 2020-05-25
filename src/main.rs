@@ -172,7 +172,6 @@ impl PSArc {
             block_sizes.push(file.read_uint::<BigEndian>(block_size.get_bytecount())?);
         }
 
-
         let mut i = Self {
             version_minor, version_major, compression_type, 
             toc_length, toc_entry_size, toc_entry_count,
@@ -481,10 +480,12 @@ impl Filesystem for PSArcFS {
         }
 
         if self.open_inode != ino {
+            print!(" => discarding open handles");
             self.open_inode = ino;
             self.open_cursor = Cursor::new(Vec::<u8>::new());
             self.psarc.print_file(&mut self.reader, &mut self.open_cursor, file_index.clone(), offset_option).unwrap();
         }
+
 
         //self.open_cursor.seek(SeekFrom::Start(0)).unwrap();
         let list_of_bytes = self.open_cursor.get_ref();
@@ -497,6 +498,9 @@ impl Filesystem for PSArcFS {
             }
         }
         reply.data(&list_of_bytes[offset as usize..end]);
+        if offset_option.is_some() {
+            self.open_inode = 0;
+        }
         println!(" => served from archive");
     }
 
