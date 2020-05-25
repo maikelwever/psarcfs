@@ -184,7 +184,7 @@ impl PSArc {
 
     fn parse_manifest(&mut self, file: &mut BufReader<File>) -> Result<()> {
         let mut cursor = Cursor::new(Vec::<u8>::new());
-        self.print_file(file, &mut cursor, 0)?;
+        self.print_file(file, &mut cursor, 0, None)?;
         let mut string_data = String::new();
         cursor.seek(SeekFrom::Start(0))?;
         cursor.read_to_string(&mut string_data)?;
@@ -211,16 +211,17 @@ impl PSArc {
         eprintln!("Amount of blocks registered:\t{}", self.block_sizes.len());
     }
 
-    fn print_file<W: io::Write>(&self, file: &mut BufReader<File>, out: &mut W, index: usize) -> Result<()> {
+    fn print_file<W: std::io::Seek + io::Write>(&self, file: &mut BufReader<File>, out: &mut W, index: usize, amount: Option<u64>) -> Result<()> {
         let entry_details = &self.entries[index];
-        eprintln!("{:?}", entry_details);
-
+        let amount = match amount {
+            Some(amt) => amt,
+            _ => entry_details.length
+        };
         let blocks = round::ceil(entry_details.length as f64 / self.block_size.get_bitcount() as f64, 0) as u64;
         file.seek(SeekFrom::Start(entry_details.offset))?;
 
         let compression = match file.read_u16::<BigEndian>() {
             Ok(value) => {
-                eprintln!("Header: {:X}", value);
                 match value {
                     0x78da | 0x7801 => CompressionType::ZLIB,
                     0x5D00 => CompressionType::LZMA,
@@ -231,8 +232,8 @@ impl PSArc {
                 return Err(Error::from(e)); 
             }
         };
-        eprintln!("File compression: {:?}", compression);
         file.seek(SeekFrom::Start(entry_details.offset))?;
+        let mut bytes_written = 0;
         match compression {
             CompressionType::None => {
                 let filesize = entry_details.length;
@@ -243,13 +244,21 @@ impl PSArc {
                 for _ in 0..blocks {
                     let mut datastream = file.take(self.block_size.get_bitcount());
                     lzma_decompress(&mut datastream, out).unwrap();
+                    let current_pos = out.seek(SeekFrom::Current(0))?;
+                    if current_pos > amount {
+                        return Ok(());
+                    }
                 }
             },
             CompressionType::ZLIB => {
                 for _ in 0..blocks {
                     let datastream = file.take(self.block_size.get_bitcount());
                     let mut decoder = ZlibDecoder::new(datastream);
-                    io::copy(&mut decoder, out)?;
+                    bytes_written += io::copy(&mut decoder, out)?;
+                    eprintln!("Bytes written: {:?} of {:?}", bytes_written, amount);
+                    if bytes_written > amount { 
+                        return Ok(());
+                    }
                 }
             },
         }
@@ -277,11 +286,12 @@ struct PSArcFS {
     tree: Tree<Inode>,
     files: HashMap<Inode, InodeData>,
     node_ids: HashMap<Inode, NodeId>,
+    cache: HashMap<Inode, [u8; 16384]>,
 }
 
 impl PSArcFS {
     fn new(psarc: PSArc, reader: BufReader<File>) -> Self {
-        let mut tree = TreeBuilder::new().with_node_capacity(5000).build();
+        let mut tree = TreeBuilder::new().with_node_capacity(10000).build();
         let mut files = HashMap::new();
         let mut node_ids = HashMap::new();
         let mut folder_names: HashMap<String, Inode> = HashMap::new();
@@ -334,6 +344,7 @@ impl PSArcFS {
             tree: tree,
             files: files,
             node_ids: node_ids,
+            cache: HashMap::new(),
         }
     }
 }
@@ -421,7 +432,7 @@ impl Filesystem for PSArcFS {
                 let attrs = FileAttr {
                     ino: ino,
                     size: file.length,
-                    blocks: 1,
+                    blocks: 0,
                     atime: UNIX_EPOCH,                                  // 1970-01-01 00:00:00
                     mtime: UNIX_EPOCH,
                     ctime: UNIX_EPOCH,
@@ -439,7 +450,20 @@ impl Filesystem for PSArcFS {
     }
 
     fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, size: u32, reply: ReplyData) {
-        println!("read called for inode {:?}, offset {:?}, size {:?}", ino, offset, size);
+        print!("read called for inode {:?}, offset {:?}, size {:?}", ino, offset, size);
+        if offset == 0 {
+            if size <= 16384 {
+                match self.cache.get(&ino) {
+                    Some(cached_data) => {
+                        println!(" => served from cache");
+                        reply.data(&cached_data[..size as usize]);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         let file_index = match self.files.get(&ino) {
             Some(InodeData::ArchivedFile(_, id)) => id,
             _ => {
@@ -449,11 +473,19 @@ impl Filesystem for PSArcFS {
         };
 
         let mut cursor = Cursor::new(Vec::<u8>::new());
-        self.psarc.print_file(&mut self.reader, &mut cursor, file_index.clone()).unwrap();
+        self.psarc.print_file(&mut self.reader, &mut cursor, file_index.clone(), Some(offset as u64 + size as u64)).unwrap();
         cursor.seek(SeekFrom::Start(0)).unwrap();
         let list_of_bytes = cursor.get_ref();
         let end = min(offset as usize + size as usize, list_of_bytes.len());
+        if offset == 0 {
+            if list_of_bytes.len() > 16384 {
+                let mut cache_arr: [u8; 16384] = [0; 16384];
+                cache_arr.copy_from_slice(&list_of_bytes[..16384]);
+                self.cache.insert(ino, cache_arr);
+            }
+        }
         reply.data(&list_of_bytes[offset as usize..end]);
+        println!(" => served from archive");
     }
 
     fn readdir(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
@@ -528,7 +560,7 @@ fn main() {
         Some(mountpoint) => {
             let psarcfs = PSArcFS::new(psarc, reader);
             let fsname = format!("fsname={}", filename);
-            let raw_options = ["-o", "ro", "-o", &fsname, "-o", "auto_unmount", "-o", "subtype=psarc"];
+            let raw_options = ["-o", "ro", "-o", &fsname, "-o", "auto_unmount", "-o", "subtype=psarc", "-o", "auto_cache"];
             let options = raw_options.iter().map(|o| o.as_ref()).collect::<Vec<&OsStr>>();
 
             match fuse::mount(psarcfs, &mountpoint.to_string(), &options) {
