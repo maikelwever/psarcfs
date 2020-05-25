@@ -14,6 +14,9 @@ Usage
 
 `psarcfs <file.psarc> <mountpoint>`
 
+Press control+c to umount filesystem and terminate psarcfs.
+
+
 Example:
 
 `psarcfs /mnt/rac/trilogy/rc1/PS3arc.psarc /tmp/test`
