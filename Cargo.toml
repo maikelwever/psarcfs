@@ -10,3 +10,6 @@ error-chain = "0.12"
 lzma-rs = '0.1'
 libmath = '0.2'
 flate2 = "1.0"
+fuse = { git = "https://github.com/zargony/fuse-rs", branch = "modernize" }
+libc = "0.2"
+id_tree = "1.7"

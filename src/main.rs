@@ -3,17 +3,28 @@
 
 extern crate byteorder;
 extern crate flate2;
+extern crate fuse;
+extern crate id_tree;
+extern crate libc;
 extern crate lzma_rs;
 extern crate math;
 
 use byteorder::{ReadBytesExt, BigEndian};
 use flate2::bufread::ZlibDecoder;
+use id_tree::InsertBehavior::{AsRoot, UnderNode};
+use id_tree::{Node, NodeId, Tree, TreeBuilder};
+use fuse::{FileType, FileAttr, Filesystem, Request, ReplyData, ReplyEntry, ReplyAttr, ReplyDirectory};
+use libc::ENOENT;
 use lzma_rs::lzma_decompress;
 use math::round;
 
+use std::cmp::min;
+use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io;
 use std::io::{Cursor, Seek, SeekFrom, Read, BufReader};
+use std::time::{Duration, UNIX_EPOCH};
 
 
 error_chain!{
@@ -177,7 +188,6 @@ impl PSArc {
         let mut string_data = String::new();
         cursor.seek(SeekFrom::Start(0))?;
         cursor.read_to_string(&mut string_data)?;
-        eprintln!("String data: {:}", string_data);
         let mut lines: Vec<&str> = string_data.lines().collect();
         let manifest_name = match self.archive_flags {
             ArchiveFlags::AbsolutePaths => "/manifest.txt",
@@ -188,12 +198,6 @@ impl PSArc {
             self.entries[i].name = line.to_string();
         }
         Ok(())
-    }
-
-    fn print_filelist(&self) {
-        for i in self.entries.iter() {
-            println!("{:?}", i);
-        }
     }
 
     fn print_details(&self) {
@@ -255,11 +259,257 @@ impl PSArc {
 }
 
 
+pub type Inode = u64;
+
+const ROOT_INODE: Inode = 1;
+const TTL: Duration = Duration::from_secs(60);           // 1 second
+
+
+enum InodeData {
+    Folder(String),
+    ArchivedFile(String, usize)
+}
+
+
+struct PSArcFS {
+    psarc: PSArc,
+    reader: BufReader<File>,
+    tree: Tree<Inode>,
+    files: HashMap<Inode, InodeData>,
+    node_ids: HashMap<Inode, NodeId>,
+}
+
+impl PSArcFS {
+    fn new(psarc: PSArc, reader: BufReader<File>) -> Self {
+        let mut tree = TreeBuilder::new().with_node_capacity(5000).build();
+        let mut files = HashMap::new();
+        let mut node_ids = HashMap::new();
+        let mut folder_names: HashMap<String, Inode> = HashMap::new();
+
+        let mut inode_counter = ROOT_INODE;
+
+        files.insert(inode_counter, InodeData::Folder(".".to_string()));
+        let root_id: NodeId = tree.insert(Node::new(inode_counter), AsRoot).unwrap();
+        node_ids.insert(inode_counter, root_id);
+        folder_names.insert(".".to_string(), inode_counter);
+
+        inode_counter += 1;
+
+        for (i, entry) in psarc.entries.iter().enumerate() {
+            let mut split_path = entry.name.split('/').filter(|x| x.len() > 0).peekable();
+            let mut current_path = "".to_string();
+            let mut parent_inode = ROOT_INODE;
+            while let Some(name) = split_path.next() {
+                if split_path.peek().is_some() {
+                    current_path.push_str(name);
+                    current_path.push('/');
+                    match folder_names.get(&current_path) {
+                        Some(inode_id) => {
+                            parent_inode = inode_id.clone();
+                        },
+                        None => {
+                            let node_id = node_ids.get(&parent_inode).unwrap();
+                            files.insert(inode_counter, InodeData::Folder(name.to_string()));
+                            let root_id: NodeId = tree.insert(Node::new(inode_counter), UnderNode(node_id)).unwrap();
+                            node_ids.insert(inode_counter, root_id);
+                            folder_names.insert(current_path.clone(), inode_counter);
+                            parent_inode = inode_counter.clone();
+                            inode_counter += 1;
+                        }
+                    }
+                } else {
+                    let node_id = node_ids.get(&parent_inode).unwrap();
+                    files.insert(inode_counter, InodeData::ArchivedFile(name.to_string(), i.clone()));
+                    let root_id: NodeId = tree.insert(Node::new(inode_counter), UnderNode(node_id)).unwrap();
+                    node_ids.insert(inode_counter, root_id);
+                    parent_inode = inode_counter.clone();
+                    inode_counter += 1;
+                }
+            }
+        }
+
+        Self {
+            psarc: psarc,
+            reader: reader,
+            tree: tree,
+            files: files,
+            node_ids: node_ids,
+        }
+    }
+}
+
+
+impl Filesystem for PSArcFS {
+    fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        match self.node_ids.get(&parent) {
+            Some(node_obj) => {
+                for child in self.tree.children(node_obj).unwrap() {
+                    let inode = child.data().clone();
+                    match self.files.get(&inode) {
+                        Some(InodeData::Folder(f)) => {
+                            if name.to_str().unwrap() == f {
+                                let attrs = FileAttr {
+                                    ino: inode,
+                                    size: 0,
+                                    blocks: 0,
+                                    atime: UNIX_EPOCH,                                  // 1970-01-01 00:00:00
+                                    mtime: UNIX_EPOCH,
+                                    ctime: UNIX_EPOCH,
+                                    ftype: FileType::Directory,
+                                    perm: 0o755,
+                                    nlink: 2,
+                                    uid: 0,
+                                    gid: 0,
+                                    rdev: 0,
+                                };
+                                reply.entry(&TTL, &attrs, 0);
+                                return;
+                            }
+                        },
+                        Some(InodeData::ArchivedFile(f, index)) => {
+                            if name.to_str().unwrap() == f {
+                                let attrs = FileAttr {
+                                    ino: inode,
+                                    size: self.psarc.entries.get(index.clone()).unwrap().length,
+                                    blocks: 0,
+                                    atime: UNIX_EPOCH,                                  // 1970-01-01 00:00:00
+                                    mtime: UNIX_EPOCH,
+                                    ctime: UNIX_EPOCH,
+                                    ftype: FileType::RegularFile,
+                                    perm: 0o755,
+                                    nlink: 2,
+                                    uid: 0,
+                                    gid: 0,
+                                    rdev: 0,
+                                };
+                                reply.entry(&TTL, &attrs, 0);
+                                return;
+                            }
+                        },
+                        None => {},
+                    }
+                }
+            },
+            _ => {}
+        }
+
+        reply.error(ENOENT);
+    }
+
+    fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
+        match self.files.get(&ino) {
+            Some(InodeData::Folder(_)) => {
+                let attrs = FileAttr {
+                    ino: ino,
+                    size: 0,
+                    blocks: 0,
+                    atime: UNIX_EPOCH,                                  // 1970-01-01 00:00:00
+                    mtime: UNIX_EPOCH,
+                    ctime: UNIX_EPOCH,
+                    ftype: FileType::Directory,
+                    perm: 0o755,
+                    nlink: 2,
+                    uid: 0,
+                    gid: 0,
+                    rdev: 0,
+                };
+                reply.attr(&TTL, &attrs);
+            },
+            Some(InodeData::ArchivedFile(_, id)) => {
+                let id = id.clone();
+                let file = &self.psarc.entries[id];
+                let attrs = FileAttr {
+                    ino: ino,
+                    size: file.length,
+                    blocks: 1,
+                    atime: UNIX_EPOCH,                                  // 1970-01-01 00:00:00
+                    mtime: UNIX_EPOCH,
+                    ctime: UNIX_EPOCH,
+                    ftype: FileType::RegularFile,
+                    perm: 0o644,
+                    nlink: 1,
+                    uid: 0,
+                    gid: 0,
+                    rdev: 0,
+                };
+                reply.attr(&TTL, &attrs);
+            },
+            _ => reply.error(ENOENT),
+        }
+    }
+
+    fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, size: u32, reply: ReplyData) {
+        println!("read called for inode {:?}, offset {:?}, size {:?}", ino, offset, size);
+        let file_index = match self.files.get(&ino) {
+            Some(InodeData::ArchivedFile(_, id)) => id,
+            _ => {
+                reply.error(ENOENT);
+                return;
+            }
+        };
+
+        let mut cursor = Cursor::new(Vec::<u8>::new());
+        self.psarc.print_file(&mut self.reader, &mut cursor, file_index.clone()).unwrap();
+        cursor.seek(SeekFrom::Start(0)).unwrap();
+        let list_of_bytes = cursor.get_ref();
+        let end = min(offset as usize + size as usize, list_of_bytes.len());
+        reply.data(&list_of_bytes[offset as usize..end]);
+    }
+
+    fn readdir(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
+        let dir_node = match self.node_ids.get(&ino) {
+            Some(node_id) => node_id,
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
+        };
+
+        if offset == 0 {
+            reply.add(ino, 1, FileType::Directory, ".");
+        }
+
+        match self.tree.ancestors(dir_node).unwrap().next() {
+            Some(x) => {
+                match self.files.get(x.data()) {
+                    Some(InodeData::Folder(_)) => {
+                        if offset < 2 {
+                            reply.add(x.data().clone(), 2, FileType::Directory, "..");
+                        }
+                    }
+                    _ => {}
+                };
+            },
+            None => {
+                if offset < 2 {
+                    reply.add(1, 2, FileType::Directory, "..");
+                }
+            }
+        };
+        for (i, child) in self.tree.children(dir_node).unwrap().enumerate().skip(offset as usize) {
+            let inode = child.data().clone();
+            match self.files.get(&inode) {
+                Some(InodeData::Folder(f)) => {
+                    reply.add(inode, (i + 2) as i64, FileType::Directory, f);
+                },
+                Some(InodeData::ArchivedFile(f, _)) => {
+                    reply.add(inode, (i + 2) as i64, FileType::RegularFile, f);
+                },
+                None => {},
+            }
+        }
+
+        reply.ok();
+    }
+}
+
+
 fn main() {
     let matches = clap_app!(myapp => 
         (version: "0.1")
         (about: "Extracts PSARC files")
         (@arg file: +required "The file to extract")
+        (@arg mountpoint: "Place to mount archive via FUSE")
     ).get_matches();
 
     let filename = matches.value_of("file").unwrap();
@@ -273,7 +523,20 @@ fn main() {
         Err(e) => panic!("{:?}", e)
     };
     psarc.print_details();
-    psarc.print_filelist();
-    //let mut stdout = io::stdout();
-    //psarc.print_file(&mut reader, &mut stdout, 0).unwrap();
+    
+    match matches.value_of("mountpoint") {
+        Some(mountpoint) => {
+            let psarcfs = PSArcFS::new(psarc, reader);
+            let fsname = format!("fsname={}", filename);
+            let raw_options = ["-o", "ro", "-o", &fsname, "-o", "auto_unmount", "-o", "subtype=psarc"];
+            let options = raw_options.iter().map(|o| o.as_ref()).collect::<Vec<&OsStr>>();
+
+            match fuse::mount(psarcfs, &mountpoint.to_string(), &options) {
+                Ok(_) => { println!("all ok!"); },
+                Err(e) => { println!("{:?}", e); }
+            }
+
+        },
+        _ => {},
+    };
 }
