@@ -255,7 +255,6 @@ impl PSArc {
                     let datastream = file.take(self.block_size.get_bitcount());
                     let mut decoder = ZlibDecoder::new(datastream);
                     bytes_written += io::copy(&mut decoder, out)?;
-                    eprintln!("Bytes written: {:?} of {:?}", bytes_written, amount);
                     if bytes_written > amount { 
                         return Ok(());
                     }
@@ -287,6 +286,8 @@ struct PSArcFS {
     files: HashMap<Inode, InodeData>,
     node_ids: HashMap<Inode, NodeId>,
     cache: HashMap<Inode, [u8; 16384]>,
+    open_inode: u64,
+    open_cursor: Cursor<Vec<u8>>,
 }
 
 impl PSArcFS {
@@ -345,6 +346,8 @@ impl PSArcFS {
             files: files,
             node_ids: node_ids,
             cache: HashMap::new(),
+            open_inode: 0,
+            open_cursor: Cursor::new(Vec::<u8>::new()),
         }
     }
 }
@@ -472,13 +475,22 @@ impl Filesystem for PSArcFS {
             }
         };
 
-        let mut cursor = Cursor::new(Vec::<u8>::new());
-        self.psarc.print_file(&mut self.reader, &mut cursor, file_index.clone(), Some(offset as u64 + size as u64)).unwrap();
-        cursor.seek(SeekFrom::Start(0)).unwrap();
-        let list_of_bytes = cursor.get_ref();
+        let mut offset_option = Some(offset as u64 + size as u64);
+        if size > 16384 {
+            offset_option = None;
+        }
+
+        if self.open_inode != ino {
+            self.open_inode = ino;
+            self.open_cursor = Cursor::new(Vec::<u8>::new());
+            self.psarc.print_file(&mut self.reader, &mut self.open_cursor, file_index.clone(), offset_option).unwrap();
+        }
+
+        //self.open_cursor.seek(SeekFrom::Start(0)).unwrap();
+        let list_of_bytes = self.open_cursor.get_ref();
         let end = min(offset as usize + size as usize, list_of_bytes.len());
         if offset == 0 {
-            if list_of_bytes.len() > 16384 {
+            if list_of_bytes.len() >= 16384 {
                 let mut cache_arr: [u8; 16384] = [0; 16384];
                 cache_arr.copy_from_slice(&list_of_bytes[..16384]);
                 self.cache.insert(ino, cache_arr);
@@ -560,7 +572,7 @@ fn main() {
         Some(mountpoint) => {
             let psarcfs = PSArcFS::new(psarc, reader);
             let fsname = format!("fsname={}", filename);
-            let raw_options = ["-o", "ro", "-o", &fsname, "-o", "auto_unmount", "-o", "subtype=psarc", "-o", "auto_cache"];
+            let raw_options = ["-o", "ro", "-o", &fsname, "-o", "auto_unmount", "-o", "subtype=psarc", "-o", "auto_cache", "-o", "direct_io"];
             let options = raw_options.iter().map(|o| o.as_ref()).collect::<Vec<&OsStr>>();
 
             match fuse::mount(psarcfs, &mountpoint.to_string(), &options) {

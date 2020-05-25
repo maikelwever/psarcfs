@@ -1,5 +1,5 @@
 [package]
-name = "psarc"
+name = "psarcfs"
 version = "0.1.0"
 authors = ["Maikel Wever <maikelwever@gmail.com>"]
 
