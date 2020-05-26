@@ -9,6 +9,16 @@ Caches the first 16384 bytes per file for improved GUI file explorer performance
 Attempts to decompress the entire file into memory because of oddness with FUSE(-rs?) I do not understand.
 
 
+Installation
+------------
+
+Install rust and cargo, either via your distro's package manager, or using rustup.
+
+Also ensure you have FUSE installed, and the `fusermount` tool available (most distros have by default).
+
+Next: run `cargo install --git https://github.com/maikelwever/psarcfs`
+
+
 Usage
 -----
 
