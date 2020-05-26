@@ -2,6 +2,7 @@
 name = "psarcfs"
 version = "0.1.0"
 authors = ["Maikel Wever <maikelwever@gmail.com>"]
+license = 'GPL-3.0'
 
 [dependencies]
 byteorder = "1"
